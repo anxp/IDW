@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -389,3 +390,105 @@ func encodeValue(value interface{}) ([32]byte, error) {
 
 	return [32]byte(encodedValue), nil
 }
+
+// =================================== RLP Encoder (move to separate package) ==========================================
+
+// RLPEncode — кодує значення у формат Recursive Length Prefix (RLP).
+// Підтримує базові типи: string, uint64, byte, *big.Int, []string, []uint64, []byte, []*big.Int.
+func RLPEncode(value interface{}) ([]byte, error) {
+
+	switch v := value.(type) {
+	case byte:
+		return encodeBytes([]byte{v}), nil
+
+	case []byte:
+		return encodeBytes(v), nil
+
+	case string:
+		return encodeBytes([]byte(v)), nil
+
+	case uint64:
+		b := uintToBytesAndTrim(v)
+		return encodeBytes(b), nil
+
+	case *big.Int:
+		if v == nil {
+			// nil big.Int кодуємо як порожній рядок (RLP для 0)
+			return encodeBytes([]byte{}), nil
+		}
+		return encodeBytes(v.Bytes()), nil
+
+	default:
+		reflectValue := reflect.ValueOf(value)
+		if reflectValue.Kind() == reflect.Slice {
+			var buf bytes.Buffer
+
+			for i := 0; i < reflectValue.Len(); i++ {
+				elem := reflectValue.Index(i).Interface()
+				enc, err := RLPEncode(elem)
+				if err != nil {
+					return nil, err
+				}
+				buf.Write(enc)
+			}
+
+			if buf.Len() <= 55 {
+				return append([]byte{byte(0xc0 + buf.Len())}, buf.Bytes()...), nil
+			} else {
+				bufLengthBytes := uintToBytesAndTrim(uint64(buf.Len()))
+				prefix := 0xf7 + len(bufLengthBytes)
+
+				return append(append([]byte{byte(prefix)}, bufLengthBytes...), buf.Bytes()...), nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("unsupported RLP type: %T", value)
+}
+
+// encodeBytes encodes byte array according to RLP rules.
+//
+//	More info: https://ethereum.org/uk/developers/docs/data-structures-and-encoding/rlp/
+func encodeBytes(b []byte) []byte {
+	l := len(b)
+	switch {
+
+	case l == 1 && b[0] < 0x80:
+		// For a single byte whose value is in the [0x00, 0x7f] (decimal [0, 127]) range,
+		// that byte is its own RLP encoding.
+		return b
+
+	case l <= 55:
+		// Otherwise, if a string is 0-55 bytes long,
+		// the RLP encoding consists of a single byte with value 0x80 (dec. 128) plus the length of the string followed by the string.
+		// The range of the first byte is thus [0x80, 0xb7] (dec. [128, 183]).
+		return append([]byte{byte(0x80 + l)}, b...)
+
+	default:
+		// If a string is more than 55 bytes long,
+		// the RLP encoding consists of a single byte with value 0xb7 (dec. 183) plus the length in bytes of the length of the string in binary form,
+		// followed by the length of the string, followed by the string.
+		// For example, a 1024 byte long string would be encoded as \xb9\x04\x00 (dec. 185, 4, 0) followed by the string. Here, 0xb9 (183 + 2 = 185) as the first byte, followed by the 2 bytes 0x0400 (dec. 1024) that denote the length of the actual string. The range of the first byte is thus [0xb8, 0xbf] (dec. [184, 191]).
+		lengthInBytes := uintToBytesAndTrim(uint64(l))
+		prefix := 0xb7 + len(lengthInBytes)
+		return append(append([]byte{byte(prefix)}, lengthInBytes...), b...)
+	}
+}
+
+// uintToBytesAndTrim — Converts uint64 to byte slice and cut off leading zeros.
+func uintToBytesAndTrim(u uint64) []byte {
+	if u == 0 {
+		// Positive integers must be represented in big-endian binary form with no leading zeroes
+		// (thus making the integer value zero equivalent to the empty byte array).
+		return []byte{}
+	}
+
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, u)
+
+	b = bytes.TrimLeft(b, "\x00")
+
+	return b
+}
+
+// =====================================================================================================================
