@@ -178,30 +178,21 @@ func main() {
 	return
 }
 
-// contractMethodCall executes method/function "functionSignature" of contract "contractAddress" with input parameters "args" and returns result of type T.
+// contractMethodCall executes method "functionSignature" of contract "contractAddress" with input parameters "args" and returns result of type T.
+//
+//	[READONLY] This is NOT-state-changing call
 //
 //	Usage examples:
 //		tickInfo, err := contractMethodCall[TickResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193252))
 //		slot0Response, err := contractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
 //		token0Response, err := contractMethodCall[Address](rpcURL, poolAddress, "token0()")
 func contractMethodCall[T any](rpcURL, contractAddress, functionSignature string, args ...interface{}) (*T, error) {
-	// 1. Compute selector
-	hash := sha3.NewLegacyKeccak256()
-	hash.Write([]byte(functionSignature))
-	fullHash := hash.Sum(nil)
-	selector := fullHash[:4] // selector is first 4 bytes of signature hash
-	data := append([]byte{}, selector...)
-
-	// 2. Encode arguments
-	for _, arg := range args {
-		encoded, err := encodeValue(arg)
-		if err != nil {
-			return nil, err
-		}
-		data = append(data, encoded[:]...) // append 32 bytes
+	data, err := encodeContractPayload(functionSignature, args)
+	if err != nil {
+		return nil, err
 	}
 
-	// 3. Prepare eth_call payload
+	// Prepare eth_call payload
 	callObj := map[string]string{
 		"to":   contractAddress,
 		"data": "0x" + hex.EncodeToString(data),
@@ -231,6 +222,24 @@ func contractMethodCall[T any](rpcURL, contractAddress, functionSignature string
 	}
 
 	return parseHexResponse[T](rpcResp.Result)
+}
+
+func encodeContractPayload(functionSignature string, args ...interface{}) ([]byte, error) {
+	hash := sha3.NewLegacyKeccak256()
+	hash.Write([]byte(functionSignature))
+	fullHash := hash.Sum(nil)
+	selector := fullHash[:4] // selector is first 4 bytes of signature hash
+	data := append([]byte{}, selector...)
+
+	for _, arg := range args {
+		encoded, err := encodeValue(arg)
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, encoded[:]...) // append 32 bytes
+	}
+
+	return data, nil
 }
 
 // parseHexResponse parses eth_call response to structured data of type T.
