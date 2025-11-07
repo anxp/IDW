@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/anxp/bytecast"
 	"golang.org/x/crypto/sha3"
@@ -104,6 +105,21 @@ const HashLength = 32
 
 type Hash [HashLength]byte
 
+// Hex returns the hex string (with 0x prefix) representation of the address.
+func (h Hash) Hex() string {
+	return "0x" + hex.EncodeToString(h[:])
+}
+
+// String implements the Stringer interface (alias of Hex()).
+func (h Hash) String() string {
+	return h.Hex()
+}
+
+// Short returns a shortened version of the address for logging/debug output.
+func (h Hash) Short() string {
+	return fmt.Sprintf("0x%s...%s", hex.EncodeToString(h[:2]), hex.EncodeToString(h[18:]))
+}
+
 func HashFromHex(s string) (Hash, error) {
 	hexValue := strings.TrimPrefix(s, "0x")
 
@@ -187,7 +203,10 @@ func main() {
 
 	block, err := GetBlock(rpcURL, nil)
 
-	_ = block
+	block397751759Number, _ := big.NewInt(0).SetString("397751759", 10)
+	block397751759, err := GetBlock(rpcURL, block397751759Number)
+
+	_, _ = block, block397751759
 
 	addr := MustFromHex("0x82af49447d8a07e3bd95bd0d56f35241523fbab1")
 
@@ -238,7 +257,7 @@ func contractMethodCall[T any](rpcURL, contractAddress, functionSignature string
 	//	00000000000000000000000000000000000000007b1502a2e910685f249c514b
 	//	00000000000000000000000000000000000000000000000000000000006e00db
 	//	0000000000000000000000000000000000000000000000000000000000000001
-	rawJson, err := callEthereumMethod(rpcURL, "eth_call", []interface{}{callObj, "latest"})
+	rawJson, err := ethereumMethodCall(rpcURL, "eth_call", []interface{}{callObj, "latest"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to call eth_call: %v", err)
 	}
@@ -575,7 +594,7 @@ func EstimateGas(rpcURL string, from Address, to Address, data []byte, value *bi
 		},
 	}
 
-	rawJson, err := callEthereumMethod(rpcURL, "eth_estimateGas", params)
+	rawJson, err := ethereumMethodCall(rpcURL, "eth_estimateGas", params)
 	if err != nil {
 		return 0, fmt.Errorf("estimateGas RPC error: %s", err)
 	}
@@ -607,7 +626,7 @@ type Block struct {
 	Hash             Hash     `json:"hash"`                 // хеш блоку
 	L1BlockNumber    uint64   `json:"l1BlockNumber,string"` // номер L1-блоку (специфічно для Arbitrum)
 	LogsBloom        []byte   `json:"logsBloom"`            // Bloom filter for logs (null if pending)
-	Miner            Address  `json:"miner"`                // Address of the mining reward recipient.
+	Miner            *Address `json:"miner"`                // Address of the mining reward recipient.
 	MixHash          Hash     `json:"mixHash"`              // хеш, що використовується в PoW
 	Nonce            uint64   `json:"nonce,string"`         // A number of prior transactions from the sender.
 	Number           *big.Int `json:"number,string"`        // номер блоку
@@ -628,22 +647,28 @@ type rpcJsonResponse struct {
 	Jsonrpc string          `json:"jsonrpc"`
 	ID      int             `json:"id"`
 	Result  json.RawMessage `json:"result"` // "result" field in rpcJsonResponse is always JSON. Compare to HEX-response in rpcContractResponse.
-	Error   *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+	Error   *RpcError       `json:"error,omitempty"`
+}
+
+type RpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e RpcError) Error() string {
+	return fmt.Sprintf("RPC error #%d: %s", e.Code, e.Message)
 }
 
 func GetBlock(rpcURL string, blockNumber *big.Int) (Block, error) {
 	blockNumberRendered := "latest"
 
 	if blockNumber != nil {
-		blockNumberRendered = blockNumber.String()
+		blockNumberRendered = "0x" + blockNumber.Text(16)
 	}
 
 	transaction_detail_flag := false // If true -> full transaction details retrieved, otherwise hashes only.
 
-	rawJson, err := callEthereumMethod(rpcURL, "eth_getBlockByNumber", []interface{}{blockNumberRendered, transaction_detail_flag})
+	rawJson, err := ethereumMethodCall(rpcURL, "eth_getBlockByNumber", []interface{}{blockNumberRendered, transaction_detail_flag})
 	if err != nil {
 		return Block{}, err
 	}
@@ -689,10 +714,10 @@ func (b *Block) UnmarshalJSON(bytes []byte) error {
 	return nil
 }
 
-// callEthereumMethod executes native eth method, like "eth_getBlockByNumber", "eth_estimateGas"
+// ethereumMethodCall executes native eth method, like "eth_getBlockByNumber", "eth_estimateGas", "eth_call"
 //
 //	Intended to use only with ethereum methods, not direct with smart contract methods!
-func callEthereumMethod(rpcURL string, method string, params []interface{}) (json.RawMessage, error) {
+func ethereumMethodCall(rpcURL string, method string, params []interface{}) (json.RawMessage, error) {
 	reqBody := map[string]interface{}{
 		"id":      1, // TODO: Should we use this ID?
 		"jsonrpc": "2.0",
@@ -702,10 +727,16 @@ func callEthereumMethod(rpcURL string, method string, params []interface{}) (jso
 
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
-		panic("Logic error on encoding payload to json in callEthereumMethod: " + err.Error())
+		// Theoretically impossible error, so we panic here.
+		// TODO: Maybe completely remove error checking here?
+		panic("Error encoding payload to json (bad input?): " + err.Error())
 	}
 
-	resp, err := http.Post(rpcURL, "application/json", bytes.NewReader(payload))
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Post(rpcURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		// This can be runtime error, like bad connection, so NO PANIC, just return an error.
 		return nil, err
@@ -714,22 +745,23 @@ func callEthereumMethod(rpcURL string, method string, params []interface{}) (jso
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		// TODO: Check which types of errors can appear here
-		panic("Error on reading response body (TODO: CHECK IF THIS IS LOGIC OR RUNTIME ERROR): " + err.Error())
+		return nil, errors.New("error reading response body: " + err.Error())
 	}
 
 	var rpcResponse rpcJsonResponse
 	if err = json.Unmarshal(body, &rpcResponse); err != nil {
-		// TODO: Check which types of errors can appear here
-		panic("Error on decoding json (TODO: CHECK IF THIS IS LOGIC OR RUNTIME ERROR): " + err.Error())
+		return nil, errors.New("failed parsing json (inconsistent structure?): " + err.Error())
 	}
+
 	if rpcResponse.Error != nil {
-		return nil, errors.New(fmt.Sprintf("%s (code %d)", rpcResponse.Error.Message, rpcResponse.Error.Code))
+		return nil, rpcResponse.Error
 	}
 
-	rawJson := rpcResponse.Result
+	if rpcResponse.Result == nil {
+		return nil, errors.New("RPC returned null")
+	}
 
-	return rawJson, nil
+	return rpcResponse.Result, nil // we return RAW JSON value encoded as []byte
 }
 
 func parseDataToTypedValue(targetType reflect.Type, data any) (reflect.Value, error) {
@@ -751,6 +783,10 @@ func parseDataToTypedValue(targetType reflect.Type, data any) (reflect.Value, er
 		return sliceOfHashesReflect, nil
 
 	case reflect.TypeOf((*big.Int)(nil)):
+		if data == nil || data.(string) == "0x" {
+			return reflect.ValueOf(big.NewInt(0)), nil
+		}
+
 		hexValue := strings.TrimPrefix(data.(string), "0x")
 		bigIntValue := big.NewInt(0)
 		bigIntValue.SetString(hexValue, 16)
@@ -793,6 +829,13 @@ func parseDataToTypedValue(targetType reflect.Type, data any) (reflect.Value, er
 			return reflect.Value{}, err
 		}
 		return reflect.ValueOf(address), nil
+
+	case reflect.TypeOf((*Address)(nil)):
+		address, err := AddressFromHex(data.(string))
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(&address), nil
 	}
 
 	panic(fmt.Sprintf("failed to parse block data - unknown type: %v", targetType.String()))
