@@ -539,38 +539,79 @@ func uintToBytesAndTrim(u uint64) []byte {
 
 // =================================== GAS (KEEP IN SEPARATE FILE IN BLOCKCHAIN BASICS PACKAGE) ========================
 
-type Gas1559Params struct {
-	GasTipCap           *big.Int // a.k.a. maxPriorityFeePerGas, "tip" для майнерів
-	GasFeeCap           *big.Int // a.k.a. maxFeePerGas, верхня межа загальної ціни газу
-	TransactionGasLimit uint64   // ліміт для виконання
+type GasParams struct {
+	Type int // 0 for legacy, 2 for EIP1559
+
+	// EIP1559 Gas Parameters
+	GasTipCap *big.Int // a.k.a. maxPriorityFeePerGas, "tip" для майнерів
+	GasFeeCap *big.Int // a.k.a. maxFeePerGas, верхня межа загальної ціни газу
+
+	// Gas limit for contract execution, EIP1559 & Legacy!
+	TransactionGasLimit uint64
+
+	// Legacy Gas Parameters
+	GasPrice *big.Int
 }
 
-func GetGasParams(rpcURL string, from Address, to Address, data []byte, value *big.Int) (Gas1559Params, error) {
+// GetGasParams returns gas parameters, supports actual (EIP-1559) as well as LEGACY headers, see GasParams.Type
+//
+//	https://ethereum.org/uk/developers/docs/gas/#how-are-gas-fees-calculated
+func GetGasParams(rpcURL string, from Address, to Address, data []byte, value *big.Int) (GasParams, error) {
 
 	block, err := GetBlock(rpcURL, nil)
 	if err != nil {
-		return Gas1559Params{}, err
+		return GasParams{}, err
 	}
-
-	// https://ethereum.org/uk/developers/docs/gas/#how-are-gas-fees-calculated
-
-	maxPriorityFeePerGas := big.NewInt(100_000_000) // TODO: make adjustable. 100_000_000 is OK for L2 network, but For L1 better to propose 2_000_000_000
-
-	twentyFivePercentFromBaseFee := big.NewInt(0)
-	twentyFivePercentFromBaseFee.Quo(block.BaseFeePerGas, big.NewInt(4))
-
-	extendedPricePerGas := big.NewInt(0) // a.k.a. maxFeePerGas (1.25*baseFee + gasTipCap)
-	extendedPricePerGas.Add(block.BaseFeePerGas, twentyFivePercentFromBaseFee).Add(extendedPricePerGas, maxPriorityFeePerGas)
 
 	transactionGasEstimate, err := EstimateGas(rpcURL, from, to, data, value)
 	if err != nil {
-		return Gas1559Params{}, err
+		return GasParams{}, err
 	}
 
-	return Gas1559Params{
-		GasTipCap:           big.NewInt(100_000_000),
-		GasFeeCap:           extendedPricePerGas,
+	baseFee := block.BaseFeePerGas
+
+	if baseFee.BitLen() != 0 { // EIP1559
+		maxPriorityFeePerGas := big.NewInt(100_000_000) // TODO: make adjustable. 100_000_000 is OK for L2 network, but For L1 better to propose 2_000_000_000
+
+		twentyFivePercentFromBaseFee := big.NewInt(0)
+		twentyFivePercentFromBaseFee.Quo(baseFee, big.NewInt(4))
+
+		extendedPricePerGas := big.NewInt(0) // a.k.a. maxFeePerGas (1.25*baseFee + gasTipCap)
+		extendedPricePerGas.Add(baseFee, twentyFivePercentFromBaseFee).Add(extendedPricePerGas, maxPriorityFeePerGas)
+
+		return GasParams{
+			Type: 2,
+
+			GasTipCap:           maxPriorityFeePerGas,
+			GasFeeCap:           extendedPricePerGas,
+			TransactionGasLimit: transactionGasEstimate,
+
+			GasPrice: nil,
+		}, nil
+	}
+
+	legacyGasPrice, err := getLegacyGasPrice(rpcURL)
+	if err != nil {
+		return GasParams{}, err
+	}
+
+	// Trying to overcome the error from BSC: "transaction underpriced: gas tip cap 50000000, minimum needed 100000000"
+	if commonPrice := big.NewInt(100_000_000); legacyGasPrice.Cmp(commonPrice) == -1 {
+		legacyGasPrice.Set(commonPrice)
+	} else {
+		twentyFivePercentFromLegacyGasPrice := big.NewInt(0)
+		twentyFivePercentFromLegacyGasPrice.Quo(legacyGasPrice, big.NewInt(4))
+		legacyGasPrice.Add(legacyGasPrice, twentyFivePercentFromLegacyGasPrice)
+	}
+
+	return GasParams{
+		Type: 0,
+
+		GasTipCap:           nil,
+		GasFeeCap:           nil,
 		TransactionGasLimit: transactionGasEstimate,
+
+		GasPrice: legacyGasPrice,
 	}, nil
 }
 
@@ -610,6 +651,31 @@ func EstimateGas(rpcURL string, from Address, to Address, data []byte, value *bi
 	}
 
 	return gas, nil
+}
+
+func getLegacyGasPrice(rpcURL string) (*big.Int, error) {
+	rawJson, err := ethereumMethodCall(rpcURL, "eth_gasPrice", []interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to request LEGACY gas price: %s", err)
+	}
+
+	var hexValue string // результат — hex string (наприклад, "0x5208")
+	if err = json.Unmarshal(rawJson, &hexValue); err != nil {
+		return nil, fmt.Errorf("failed to request LEGACY gas price: %s", err)
+	}
+
+	if hexValue == "0x" {
+		return big.NewInt(0), nil
+	}
+
+	hexValue = strings.TrimPrefix(hexValue, "0x")
+	bigIntValue, ok := big.NewInt(0).SetString(hexValue, 16)
+
+	if !ok {
+		return nil, fmt.Errorf("failed to request LEGACY gas price, got invalid hex value")
+	}
+
+	return bigIntValue, nil
 }
 
 // =====================================================================================================================
