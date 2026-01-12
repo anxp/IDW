@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"reflect"
@@ -186,57 +190,54 @@ type TicksResponse struct {
 
 func main() {
 
-	token := MustFromHex("0x82af49447d8a07e3bd95bd0d56f35241523fbab1")
-	spender := MustFromHex("0xf3eb87c1f6020982173c908e7eb31aa66c1f0296")
-	owner := MustFromHex("0x1234567890abcdef1234567890abcdef12345678")
-
-	// формуємо payload для approve(address,uint256)
-	data, _ := encodeContractPayload("approve(address,uint256)", spender, big.NewInt(1000000000000000000))
-
-	// оцінюємо gasLimit
-	gasLimit, err := EstimateGas(rpcURL, owner, token, data, big.NewInt(0))
+	secp256k1 := InitSECP256K1Curve()
+	privateKey, err := LoadPrivateKey("PRIVATE KEY HERE", secp256k1)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	fmt.Println("GasLimit (estimated):", gasLimit)
+	from := MustFromHex("0x35976f39BCe40Ce858fB66360c49231E6B8Ee4A1")            // address of my wallet
+	arbSushiRouter5 := MustFromHex("0xf2614A233c7C3e7f08b1F887Ba133a13f1eb2c55") // router, the contract who actually does swap
+	arbUsdcContract := MustFromHex("0xaf88d065e77c8cC2239327C5EDb3A432268e5831") // contract of USDC token deployed in Arbitrum
+	amountUSDC6Dec := big.NewInt(1000000)                                        // amount, 1 usdc
 
-	block, err := GetBlock(rpcURL, nil)
+	approveData, err := EncodeContractPayload("approve(address,uint256)", arbSushiRouter5, amountUSDC6Dec)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	block397751759Number, _ := big.NewInt(0).SetString("397751759", 10)
-	block397751759, err := GetBlock(rpcURL, block397751759Number)
+	gas, err := GetGasParams(rpcURL, from, arbUsdcContract, approveData, big.NewInt(0))
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	_, _ = block, block397751759
+	txHash, err := ExecuteTx(rpcURL, privateKey, &arbUsdcContract, big.NewInt(42161), gas, big.NewInt(0), approveData)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	addr := MustFromHex("0x82af49447d8a07e3bd95bd0d56f35241523fbab1")
+	_ = txHash
 
-	fmt.Println("Full:", addr.Hex())
-	fmt.Println("Short:", addr.Short())
-	fmt.Println("Bytes:", addr.Bytes())
-	fmt.Println("IsZero:", addr.IsZero())
-
-	var zero Address
-	fmt.Println("Zero address check:", zero.IsZero())
-
-	ticksResponse, err := contractMethodCall[TicksResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193630))
-	slot0Response, err := contractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
-	token0Response, err := contractMethodCall[Address](rpcURL, poolAddress, "token0()")
+	ticksResponse, err := ContractMethodCall[TicksResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193630))
+	slot0Response, err := ContractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
+	token0Response, err := ContractMethodCall[Address](rpcURL, poolAddress, "token0()")
 
 	_, _, _, _ = ticksResponse, slot0Response, token0Response, err
 
 	return
 }
 
-// contractMethodCall executes method "functionSignature" of contract "contractAddress" with input parameters "args" and returns result of type T.
+// ContractMethodCall executes method "functionSignature" of contract "contractAddress" with input parameters "args" and returns result of type T.
 //
 //	[READONLY] This is NOT-state-changing call
+//	>>> See ExecuteTx for state-changing call
 //
 //	Usage examples:
-//		tickInfo, err := contractMethodCall[TickResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193252))
-//		slot0Response, err := contractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
-//		token0Response, err := contractMethodCall[Address](rpcURL, poolAddress, "token0()")
-func contractMethodCall[T any](rpcURL, contractAddress, functionSignature string, args ...interface{}) (*T, error) {
-	data, err := encodeContractPayload(functionSignature, args...)
+//		tickInfo, err := ContractMethodCall[TickResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193252))
+//		slot0Response, err := ContractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
+//		token0Response, err := ContractMethodCall[Address](rpcURL, poolAddress, "token0()")
+func ContractMethodCall[T any](rpcURL, contractAddress, functionSignature string, args ...interface{}) (*T, error) {
+	data, err := EncodeContractPayload(functionSignature, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +272,68 @@ func contractMethodCall[T any](rpcURL, contractAddress, functionSignature string
 	return parseHexResponse[T](hexResult)
 }
 
-func encodeContractPayload(functionSignature string, args ...interface{}) ([]byte, error) {
+// ExecuteTx executes transaction and returns transaction hash.
+//
+//	[WRITE] This IS state-changing call
+//	>>> See ContractMethodCall for NOT-state-changing call
+//
+//	Use EncodeContractPayload() method to encode data parameter.
+func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID *big.Int, gas GasParams, value *big.Int, data []byte) (txHash string, err error) {
+	from := GetAddressFromPrivateKey(privateKey)
+
+	nonce, err := GetNonce(from)
+	if err != nil {
+		return "", err
+	}
+
+	if gas.Type == 2 {
+		rawTx1559, err := buildRawTransaction1559(chainID, nonce, to, gas, value, data)
+		if err != nil {
+			return "", err
+		}
+
+		txRawRlpEncoded, err := rlpEncodeTransaction1559ForSigning(rawTx1559)
+		if err != nil {
+			return "", err
+		}
+
+		txRawHash := hashTransaction1559(txRawRlpEncoded)
+
+		secp256k1 := InitSECP256K1Curve()
+
+		v, r, s, err := Sign1559Hash(txRawHash, privateKey, secp256k1)
+		if err != nil {
+			return "", err
+		}
+
+		rawTx1559.V = v
+		rawTx1559.R = r
+		rawTx1559.S = s
+
+		txSignedRlpEncoded, err := rlpEncodeTransaction1559AfterSigning(rawTx1559)
+		if err != nil {
+			return "", err
+		}
+
+		txHex := "0x" + hex.EncodeToString(txSignedRlpEncoded)
+
+		rawJson, err := ethereumMethodCall(rpcURL, "eth_sendRawTransaction", []interface{}{txHex})
+		if err != nil {
+			return "", err
+		}
+
+		if err = json.Unmarshal(rawJson, &txHash); err != nil {
+			return "", err
+		}
+
+		return txHash, nil
+
+	} else {
+		panic("this transaction type not yet implemented")
+	}
+}
+
+func EncodeContractPayload(functionSignature string, args ...interface{}) ([]byte, error) {
 	hash := sha3.NewLegacyKeccak256()
 	hash.Write([]byte(functionSignature))
 	fullHash := hash.Sum(nil)
@@ -709,6 +771,39 @@ type Block struct {
 	Uncles           []Hash   `json:"uncles"`               // Array of uncle block hashes
 }
 
+type Transaction1559 struct {
+	ChainID              *big.Int
+	Nonce                uint64
+	MaxPriorityFeePerGas *big.Int
+	MaxFeePerGas         *big.Int
+	GasLimit             uint64
+	To                   *Address // nil якщо створюємо контракт
+	Value                *big.Int
+	Data                 []byte
+	AccessList           AccessList
+	V, R, S              *big.Int // додаються після підпису
+}
+
+// AccessList is an EIP-2930 access list.
+type AccessList []AccessTuple
+
+// AccessTuple is the element type of an AccessList.
+type AccessTuple struct {
+	Address     Address
+	StorageKeys []Hash
+}
+
+// TransactionLegacy is the transaction data of the original Ethereum transactions, still used, however, on Binance Smart Chain (BSC).
+type TransactionLegacy struct {
+	Nonce    uint64
+	GasPrice *big.Int // wei per gas
+	GasLimit uint64
+	To       *Address // nil якщо створюємо контракт
+	Value    *big.Int
+	Data     []byte
+	V, R, S  *big.Int // додаються після підпису
+}
+
 type rpcJsonResponse struct {
 	Jsonrpc string          `json:"jsonrpc"`
 	ID      int             `json:"id"`
@@ -745,6 +840,25 @@ func GetBlock(rpcURL string, blockNumber *big.Int) (Block, error) {
 	}
 
 	return block, nil
+}
+
+func GetNonce(account Address) (uint64, error) {
+	rawJson, err := ethereumMethodCall(rpcURL, "eth_getTransactionCount", []interface{}{account.String(), "pending"})
+	if err != nil {
+		return 0, err
+	}
+
+	var hexValue string // результат — hex string (наприклад, "0x5208")
+	if err = json.Unmarshal(rawJson, &hexValue); err != nil {
+		return 0, err
+	}
+
+	nonce, err := strconv.ParseUint(strings.TrimPrefix(hexValue, "0x"), 16, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return nonce, nil
 }
 
 func (b *Block) UnmarshalJSON(bytes []byte) error {
@@ -905,6 +1019,374 @@ func parseDataToTypedValue(targetType reflect.Type, data any) (reflect.Value, er
 	}
 
 	panic(fmt.Sprintf("failed to parse block data - unknown type: %v", targetType.String()))
+}
+
+func buildRawTransaction1559(
+	chainID *big.Int,
+	nonce uint64,
+	to *Address,
+	gas GasParams,
+	value *big.Int,
+	data []byte,
+
+) (*Transaction1559, error) {
+	if chainID == nil {
+		return nil, errors.New("chainID is required")
+	}
+
+	if nonce < 0 {
+		return nil, errors.New("nonce is required and should be not negative")
+	}
+
+	tx := Transaction1559{
+		ChainID:              chainID,
+		Nonce:                nonce,
+		MaxPriorityFeePerGas: gas.GasTipCap,
+		MaxFeePerGas:         gas.GasFeeCap,
+		GasLimit:             gas.TransactionGasLimit,
+		To:                   to,
+		Value:                value,
+		Data:                 data,
+		AccessList:           AccessList{},
+		V:                    big.NewInt(0),
+		R:                    big.NewInt(0),
+		S:                    big.NewInt(0),
+	}
+
+	return &tx, nil
+}
+
+func rlpEncodeTransaction1559ForSigning(tx *Transaction1559) ([]byte, error) {
+	// An EIP-1559 (Type 2) transaction's RLP-encoded prefix is the byte 0x02, indicating its type,
+	// followed by the RLP-encoded list of transaction fields:
+	// chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, v, r, and s (in that specific order),
+	// all themselves RLP-encoded. This structure is different from legacy transactions, which lack the type byte and have a different field order.
+	list := []interface{}{
+		tx.ChainID,
+		tx.Nonce,
+		tx.MaxPriorityFeePerGas,
+		tx.MaxFeePerGas,
+		tx.GasLimit,
+		func() []byte {
+			if tx.To == nil {
+				return []byte{}
+			}
+			return tx.To.Bytes()
+		}(),
+		tx.Value,
+		tx.Data,
+		[]interface{}{}, // AccessList пустий
+	}
+
+	encodedList, err := RLPEncode(list)
+	if err != nil {
+		return nil, err
+	}
+
+	// Транзакції EIP-1559 завжди мають префікс типу 0x02 перед RLP-кодом.
+	return append([]byte{0x02}, encodedList...), nil
+}
+
+func rlpEncodeTransaction1559AfterSigning(tx *Transaction1559) ([]byte, error) {
+	// An EIP-1559 (Type 2) transaction's RLP-encoded prefix is the byte 0x02, indicating its type,
+	// followed by the RLP-encoded list of transaction fields:
+	// chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, v, r, and s (in that specific order),
+	// all themselves RLP-encoded. This structure is different from legacy transactions, which lack the type byte and have a different field order.
+	list := []interface{}{
+		tx.ChainID,
+		tx.Nonce,
+		tx.MaxPriorityFeePerGas,
+		tx.MaxFeePerGas,
+		tx.GasLimit,
+		func() []byte {
+			if tx.To == nil {
+				return []byte{}
+			}
+			return tx.To.Bytes()
+		}(),
+		tx.Value,
+		tx.Data,
+		[]interface{}{}, // AccessList пустий
+		tx.V,
+		tx.R,
+		tx.S,
+	}
+
+	encodedList, err := RLPEncode(list)
+	if err != nil {
+		return nil, err
+	}
+
+	// Транзакції EIP-1559 завжди мають префікс типу 0x02 перед RLP-кодом.
+	return append([]byte{0x02}, encodedList...), nil
+}
+
+func hashTransaction1559(rlpEncoded []byte) []byte {
+	h := sha3.NewLegacyKeccak256()
+	h.Write(rlpEncoded)
+	return h.Sum(nil)
+}
+
+// TODO: buildRawTransactionLegacy, rlpEncodeTransactionLegacyForSigning
+
+// =====================================================================================================================
+
+// =================================== SECP256K1 MINIMAL IMPLEMENTATION ================================================
+
+// SECP256K1Curve implements minimal secp256k1 with basic ScalarBaseMult and ScalarMult
+type SECP256K1Curve struct {
+	*elliptic.CurveParams
+}
+
+func InitSECP256K1Curve() elliptic.Curve {
+
+	// General elliptic curve:
+	// y² = x³ + ax + b (mod p)
+	//
+	// secp256k1 elliptic curve:
+	// y² = x³ + 7 (mod p)
+	//
+	// secp256k1 curve params:
+	// 	B = 7 -- just common value
+	// 	P = 2²⁵⁶ - 2³² - 977 -- prime field (big PRIME number)
+	//	G = (Gx, Gy) -- starting point of generation
+	//	d -- Private key, big random number
+	//	Q = d × G -- Public key, × here is not multiplication, but multiple addition of a point
+	//	N -- is the order of the generator, the smallest number N such that N × G = a point at infinity; private key d ∈ [1, N-1]
+	// 	BitSize = 256 -- this curve ~256 bits of security
+	//
+	// Elliptic Curve Discrete Logarithm Problem:
+	// 	EASY: Q = d × G
+	//	ALMOST NOT POSSIBLE: d = log_G(Q)
+
+	params := new(elliptic.CurveParams)
+
+	params.Name = "secp256k1"
+	params.P, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16)
+	params.N, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+	params.B = big.NewInt(7)
+	params.Gx, _ = new(big.Int).SetString("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16)
+	params.Gy, _ = new(big.Int).SetString("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16)
+	params.BitSize = 256
+
+	return &SECP256K1Curve{params}
+}
+
+// IsOnCurve перевіряє, що точка (x,y) лежить на кривій y² = x³ + 7 mod P
+func (c *SECP256K1Curve) IsOnCurve(x, y *big.Int) bool {
+	if x.Sign() < 0 || y.Sign() < 0 {
+		return false
+	}
+	p := c.P
+	y2 := new(big.Int).Mul(y, y)
+	y2.Mod(y2, p)
+
+	x3 := new(big.Int).Mul(x, x)
+	x3.Mul(x3, x)
+	x3.Add(x3, c.B)
+	x3.Mod(x3, p)
+
+	return y2.Cmp(x3) == 0
+}
+
+// Add повертає P + Q на кривій
+func (c *SECP256K1Curve) Add(x1, y1, x2, y2 *big.Int) (*big.Int, *big.Int) {
+	p := c.P
+	if x1.Sign() == 0 && y1.Sign() == 0 {
+		return new(big.Int).Set(x2), new(big.Int).Set(y2)
+	}
+	if x2.Sign() == 0 && y2.Sign() == 0 {
+		return new(big.Int).Set(x1), new(big.Int).Set(y1)
+	}
+
+	var m, x3, y3 big.Int
+
+	if x1.Cmp(x2) == 0 && y1.Cmp(y2) == 0 {
+		// Point doubling
+		two := big.NewInt(2)
+		three := big.NewInt(3)
+
+		num := new(big.Int).Mul(three, new(big.Int).Mul(x1, x1))
+		num.Mod(num, p)
+
+		den := new(big.Int).Mul(two, y1)
+		den.ModInverse(den, p)
+
+		m.Mul(num, den)
+		m.Mod(&m, p)
+	} else {
+		// Point addition
+		num := new(big.Int).Sub(y2, y1)
+		den := new(big.Int).Sub(x2, x1)
+		den.ModInverse(den, p)
+
+		m.Mul(num, den)
+		m.Mod(&m, p)
+	}
+
+	x3.Mul(&m, &m)
+	x3.Sub(&x3, x1)
+	x3.Sub(&x3, x2)
+	x3.Mod(&x3, p)
+
+	y3.Sub(x1, &x3)
+	y3.Mul(&y3, &m)
+	y3.Sub(&y3, y1)
+	y3.Mod(&y3, p)
+
+	return &x3, &y3
+}
+
+// ScalarMult обчислює k*(x,y)
+func (c *SECP256K1Curve) ScalarMult(Bx, By *big.Int, k []byte) (*big.Int, *big.Int) {
+	x, y := big.NewInt(0), big.NewInt(0)
+	for _, b := range k {
+		for i := 7; i >= 0; i-- {
+			x, y = c.Add(x, y, x, y) // double
+			if (b>>uint(i))&1 == 1 {
+				x, y = c.Add(x, y, Bx, By)
+			}
+		}
+	}
+	return x, y
+}
+
+// ScalarBaseMult обчислює k*G
+func (c *SECP256K1Curve) ScalarBaseMult(k []byte) (*big.Int, *big.Int) {
+	return c.ScalarMult(c.Gx, c.Gy, k)
+}
+
+func LoadPrivateKey(hexKey string, secp256k1 elliptic.Curve) (*ecdsa.PrivateKey, error) {
+	keyBytes, err := hex.DecodeString(strings.TrimPrefix(hexKey, "0x"))
+	if err != nil {
+		return nil, err
+	}
+
+	private := new(ecdsa.PrivateKey)
+	private.PublicKey.Curve = secp256k1
+	private.D = new(big.Int).SetBytes(keyBytes)
+	private.PublicKey.X, private.PublicKey.Y = secp256k1.ScalarBaseMult(keyBytes)
+
+	return private, nil
+}
+
+func GetAddressFromPrivateKey(privateKey *ecdsa.PrivateKey) Address {
+	pubX := privateKey.PublicKey.X
+	pubY := privateKey.PublicKey.Y
+
+	return GetAddressFromPublicKey(pubX, pubY)
+}
+
+func GetAddressFromPublicKey(pubX, pubY *big.Int) Address {
+	// General formula of address calculation: address = last20bytes( keccak256(pubkey[64]) )
+
+	xBytes := pubX.Bytes()
+	yBytes := pubY.Bytes()
+
+	// гарантовано 32 байти кожен
+	paddedX := append(make([]byte, 32-len(xBytes)), xBytes...)
+	paddedY := append(make([]byte, 32-len(yBytes)), yBytes...)
+
+	pubkey := append(paddedX, paddedY...)
+
+	hash := sha3.NewLegacyKeccak256()
+	hash.Write(pubkey)
+	sum := hash.Sum(nil)
+
+	var addr Address
+	copy(addr[:], sum[12:]) // last 20 bytes
+
+	return addr
+}
+
+func Sign1559Hash(hash []byte, privateKey *ecdsa.PrivateKey, secp256k1 elliptic.Curve) (v, r, s *big.Int, err error) {
+
+	r, s, err = ecdsa.Sign(rand.Reader, privateKey, hash)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// EIP-2: normalize S
+	curveN := secp256k1.Params().N
+	halfN := new(big.Int).Rsh(curveN, 1)
+	if s.Cmp(halfN) == 1 {
+		s.Sub(curveN, s)
+	}
+
+	// v = recovery id (0 or 1)
+	// Стандартний ecdsa.Sign НЕ повертає recoveryID,
+	// тому ми обчислюємо його вручну:
+	recID := recoverID(privateKey.PublicKey.X, privateKey.PublicKey.Y, r, s, hash, secp256k1)
+
+	return big.NewInt(int64(recID)), r, s, nil
+}
+
+func recoverID(pubX, pubY, r, s *big.Int, hash []byte, secp256k1 elliptic.Curve) int {
+	// brute-force: пробуємо v=0 і v=1
+	for v := 0; v <= 1; v++ {
+		x, y := recoverPublicKey(r, s, hash, v, secp256k1)
+		if x != nil && x.Cmp(pubX) == 0 && y.Cmp(pubY) == 0 {
+			return v
+		}
+	}
+	panic("failed to recover v")
+}
+
+func modSqrt(y2, p *big.Int) *big.Int {
+	// p % 4 == 3 для secp256k1 → sqrt = y2^((p+1)/4)
+	exp := new(big.Int).Add(p, big.NewInt(1))
+	exp.Div(exp, big.NewInt(4))
+	return new(big.Int).Exp(y2, exp, p)
+}
+
+func recoverPublicKey(r, s *big.Int, hash []byte, v int, secp256k1 elliptic.Curve) (*big.Int, *big.Int) {
+	params := secp256k1.Params()
+
+	z := new(big.Int).SetBytes(hash)
+	z.Mod(z, params.N)
+
+	// 1. Відновлюємо R.x = r
+	x := new(big.Int).Set(r)
+
+	// y² = x³ + 7 mod p
+	y2 := new(big.Int).Exp(x, big.NewInt(3), params.P)
+	y2.Add(y2, params.B)
+	y2.Mod(y2, params.P)
+
+	y := modSqrt(y2, params.P)
+	if y == nil {
+		return nil, nil
+	}
+
+	// Вибір знаку y через v
+	if y.Bit(0) != uint(v) {
+		y.Sub(params.P, y)
+	}
+
+	if !secp256k1.IsOnCurve(x, y) {
+		return nil, nil
+	}
+
+	// 2. r⁻¹ mod N
+	rInv := new(big.Int).ModInverse(r, params.N)
+	if rInv == nil {
+		return nil, nil
+	}
+
+	// s·R
+	sR_x, sR_y := secp256k1.ScalarMult(x, y, s.Bytes())
+
+	// z·G
+	zG_x, zG_y := secp256k1.ScalarBaseMult(z.Bytes())
+	zG_y.Neg(zG_y).Mod(zG_y, params.P)
+
+	// sR − zG
+	Qx, Qy := secp256k1.Add(sR_x, sR_y, zG_x, zG_y)
+
+	// r⁻¹ · (sR − zG)
+	Qx, Qy = secp256k1.ScalarMult(Qx, Qy, rInv.Bytes())
+
+	return Qx, Qy
 }
 
 // =====================================================================================================================
