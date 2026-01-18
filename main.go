@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	rpcURL      = "https://arb1.arbitrum.io/rpc"
-	poolAddress = "0xf3eb87c1f6020982173c908e7eb31aa66c1f0296"
+	rpcURLArbitrum = "https://arb1.arbitrum.io/rpc"
+	rpcURLBSC      = "https://bsc.drpc.org"
+	poolAddress    = "0xf3eb87c1f6020982173c908e7eb31aa66c1f0296"
 )
 
 // =================================== ADDRESS TYPE (EXPORT TO SEP FILE) ===============================================
@@ -199,28 +200,37 @@ func main() {
 	from := MustFromHex("0x35976f39BCe40Ce858fB66360c49231E6B8Ee4A1")            // address of my wallet
 	arbSushiRouter5 := MustFromHex("0xf2614A233c7C3e7f08b1F887Ba133a13f1eb2c55") // router, the contract who actually does swap
 	arbUsdcContract := MustFromHex("0xaf88d065e77c8cC2239327C5EDb3A432268e5831") // contract of USDC token deployed in Arbitrum
-	amountUSDC6Dec := big.NewInt(1000000)                                        // amount, 1 usdc
+	arbChainID := big.NewInt(42161)
+	amountUSDC6Dec := big.NewInt(1000000) // amount, 1 usdc
 
-	approveData, err := EncodeContractPayload("approve(address,uint256)", arbSushiRouter5, amountUSDC6Dec)
+	from = MustFromHex("0x35976f39BCe40Ce858fB66360c49231E6B8Ee4A1")             // address of my wallet
+	bscSushiRouter4 := MustFromHex("0x33d91116e0370970444B0281AB117e161fEbFcdD") // router, the contract who actually does swap
+	bscUsdcContract := MustFromHex("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d") // contract of USDC token deployed in Arbitrum
+	bscChainID := big.NewInt(56)
+	amountUSDC18Dec := big.NewInt(1000000000000000000) // amount, 1 usdc
+
+	_, _, _, _ = arbSushiRouter5, arbUsdcContract, amountUSDC6Dec, arbChainID
+
+	approveData, err := EncodeContractPayload("approve(address,uint256)", bscSushiRouter4, amountUSDC18Dec)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	gas, err := GetGasParams(rpcURL, from, arbUsdcContract, approveData, big.NewInt(0))
+	gas, err := GetGasParams(rpcURLBSC, from, bscUsdcContract, approveData, big.NewInt(0))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	txHash, err := ExecuteTx(rpcURL, privateKey, &arbUsdcContract, big.NewInt(42161), gas, big.NewInt(0), approveData)
+	txHash, err := ExecuteTx(rpcURLBSC, privateKey, &bscUsdcContract, bscChainID, gas, big.NewInt(0), approveData)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	_ = txHash
 
-	ticksResponse, err := ContractMethodCall[TicksResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193630))
-	slot0Response, err := ContractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
-	token0Response, err := ContractMethodCall[Address](rpcURL, poolAddress, "token0()")
+	ticksResponse, err := ContractMethodCall[TicksResponse](rpcURLArbitrum, poolAddress, "ticks(int24)", int32(-193630))
+	slot0Response, err := ContractMethodCall[Slot0Response](rpcURLArbitrum, poolAddress, "slot0()")
+	token0Response, err := ContractMethodCall[Address](rpcURLArbitrum, poolAddress, "token0()")
 
 	_, _, _, _ = ticksResponse, slot0Response, token0Response, err
 
@@ -281,7 +291,7 @@ func ContractMethodCall[T any](rpcURL, contractAddress, functionSignature string
 func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID *big.Int, gas GasParams, value *big.Int, data []byte) (txHash string, err error) {
 	from := GetAddressFromPrivateKey(privateKey)
 
-	nonce, err := GetNonce(from)
+	nonce, err := GetNonce(from, rpcURL)
 	if err != nil {
 		return "", err
 	}
@@ -297,7 +307,7 @@ func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID
 			return "", err
 		}
 
-		txRawHash := hashTransaction1559(txRawRlpEncoded)
+		txRawHash := hashTransaction(txRawRlpEncoded)
 
 		secp256k1 := InitSECP256K1Curve()
 
@@ -328,6 +338,51 @@ func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID
 
 		return txHash, nil
 
+	} else if gas.Type == 0 {
+		rawTxLegacy, err := buildRawTransactionLegacy(nonce, to, gas, value, data)
+		if err != nil {
+			return "", err
+		}
+
+		txRawRlpEncoded, err := rlpEncodeTransactionLegacyForSigning(rawTxLegacy, chainID)
+		if err != nil {
+			return "", err
+		}
+
+		txRawHash := hashTransaction(txRawRlpEncoded)
+
+		secp256k1 := InitSECP256K1Curve()
+
+		// We can reuse EIP1559 signer, but don't forget we should upgrade "v" after signing (according to EIP-155)!
+		v, r, s, err := Sign1559Hash(txRawHash, privateKey, secp256k1)
+		if err != nil {
+			return "", err
+		}
+
+		// v = recID + 35 + 2*chainId
+		v.Add(v, big.NewInt(35)).Add(v, big.NewInt(0).Mul(chainID, big.NewInt(2)))
+
+		rawTxLegacy.V = v
+		rawTxLegacy.R = r
+		rawTxLegacy.S = s
+
+		txSignedRlpEncoded, err := rlpEncodeTransactionLegacyAfterSigning(rawTxLegacy)
+		if err != nil {
+			return "", err
+		}
+
+		txHex := "0x" + hex.EncodeToString(txSignedRlpEncoded)
+
+		rawJson, err := ethereumMethodCall(rpcURL, "eth_sendRawTransaction", []interface{}{txHex})
+		if err != nil {
+			return "", err
+		}
+
+		if err = json.Unmarshal(rawJson, &txHash); err != nil {
+			return "", err
+		}
+
+		return txHash, nil
 	} else {
 		panic("this transaction type not yet implemented")
 	}
@@ -842,7 +897,7 @@ func GetBlock(rpcURL string, blockNumber *big.Int) (Block, error) {
 	return block, nil
 }
 
-func GetNonce(account Address) (uint64, error) {
+func GetNonce(account Address, rpcURL string) (uint64, error) {
 	rawJson, err := ethereumMethodCall(rpcURL, "eth_getTransactionCount", []interface{}{account.String(), "pending"})
 	if err != nil {
 		return 0, err
@@ -1121,13 +1176,72 @@ func rlpEncodeTransaction1559AfterSigning(tx *Transaction1559) ([]byte, error) {
 	return append([]byte{0x02}, encodedList...), nil
 }
 
-func hashTransaction1559(rlpEncoded []byte) []byte {
+func hashTransaction(rlpEncoded []byte) []byte {
 	h := sha3.NewLegacyKeccak256()
 	h.Write(rlpEncoded)
 	return h.Sum(nil)
 }
 
-// TODO: buildRawTransactionLegacy, rlpEncodeTransactionLegacyForSigning
+func buildRawTransactionLegacy(nonce uint64, to *Address, gas GasParams, value *big.Int, data []byte) (*TransactionLegacy, error) {
+	if nonce < 0 {
+		return nil, errors.New("nonce is required and should be not negative")
+	}
+
+	tx := TransactionLegacy{
+		Nonce:    nonce,
+		GasPrice: gas.GasPrice,
+		GasLimit: gas.TransactionGasLimit,
+		To:       to,
+		Value:    value,
+		Data:     data,
+	}
+
+	return &tx, nil
+}
+
+func rlpEncodeTransactionLegacyForSigning(tx *TransactionLegacy, chainID *big.Int) ([]byte, error) {
+	list := []interface{}{
+		tx.Nonce,
+		tx.GasPrice,
+		tx.GasLimit,
+		func() []byte {
+			if tx.To == nil {
+				return []byte{}
+			}
+			return tx.To.Bytes()
+		}(),
+		tx.Value,
+		tx.Data,
+
+		// EIP-155 extras
+		chainID,
+		uint64(0),
+		uint64(0),
+	}
+
+	return RLPEncode(list)
+}
+
+func rlpEncodeTransactionLegacyAfterSigning(tx *TransactionLegacy) ([]byte, error) {
+	list := []interface{}{
+		tx.Nonce,
+		tx.GasPrice,
+		tx.GasLimit,
+		func() []byte {
+			if tx.To == nil {
+				return []byte{}
+			}
+			return tx.To.Bytes()
+		}(),
+		tx.Value,
+		tx.Data,
+		tx.V,
+		tx.R,
+		tx.S,
+	}
+
+	return RLPEncode(list)
+}
 
 // =====================================================================================================================
 
