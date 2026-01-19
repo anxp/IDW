@@ -228,6 +228,13 @@ func main() {
 
 	_ = txHash
 
+	receipt, err := WaitTransactionReady(rpcURLBSC, txHash)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_ = receipt
+
 	ticksResponse, err := ContractMethodCall[TicksResponse](rpcURLArbitrum, poolAddress, "ticks(int24)", int32(-193630))
 	slot0Response, err := ContractMethodCall[Slot0Response](rpcURLArbitrum, poolAddress, "slot0()")
 	token0Response, err := ContractMethodCall[Address](rpcURLArbitrum, poolAddress, "token0()")
@@ -288,23 +295,23 @@ func ContractMethodCall[T any](rpcURL, contractAddress, functionSignature string
 //	>>> See ContractMethodCall for NOT-state-changing call
 //
 //	Use EncodeContractPayload() method to encode data parameter.
-func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID *big.Int, gas GasParams, value *big.Int, data []byte) (txHash string, err error) {
+func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID *big.Int, gas GasParams, value *big.Int, data []byte) (txHash *Hash, err error) {
 	from := GetAddressFromPrivateKey(privateKey)
 
 	nonce, err := GetNonce(from, rpcURL)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if gas.Type == 2 {
 		rawTx1559, err := buildRawTransaction1559(chainID, nonce, to, gas, value, data)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		txRawRlpEncoded, err := rlpEncodeTransaction1559ForSigning(rawTx1559)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		txRawHash := hashTransaction(txRawRlpEncoded)
@@ -313,7 +320,7 @@ func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID
 
 		v, r, s, err := Sign1559Hash(txRawHash, privateKey, secp256k1)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		rawTx1559.V = v
@@ -322,31 +329,37 @@ func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID
 
 		txSignedRlpEncoded, err := rlpEncodeTransaction1559AfterSigning(rawTx1559)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		txHex := "0x" + hex.EncodeToString(txSignedRlpEncoded)
 
 		rawJson, err := ethereumMethodCall(rpcURL, "eth_sendRawTransaction", []interface{}{txHex})
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
-		if err = json.Unmarshal(rawJson, &txHash); err != nil {
-			return "", err
+		txHashString := ""
+		if err = json.Unmarshal(rawJson, &txHashString); err != nil {
+			return nil, err
 		}
 
-		return txHash, nil
+		txHashObject, err := HashFromHex(txHashString)
+		if err != nil {
+			return nil, err
+		}
+
+		return &txHashObject, nil
 
 	} else if gas.Type == 0 {
 		rawTxLegacy, err := buildRawTransactionLegacy(nonce, to, gas, value, data)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		txRawRlpEncoded, err := rlpEncodeTransactionLegacyForSigning(rawTxLegacy, chainID)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		txRawHash := hashTransaction(txRawRlpEncoded)
@@ -356,7 +369,7 @@ func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID
 		// We can reuse EIP1559 signer, but don't forget we should upgrade "v" after signing (according to EIP-155)!
 		v, r, s, err := Sign1559Hash(txRawHash, privateKey, secp256k1)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		// v = recID + 35 + 2*chainId
@@ -368,24 +381,178 @@ func ExecuteTx(rpcURL string, privateKey *ecdsa.PrivateKey, to *Address, chainID
 
 		txSignedRlpEncoded, err := rlpEncodeTransactionLegacyAfterSigning(rawTxLegacy)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		txHex := "0x" + hex.EncodeToString(txSignedRlpEncoded)
 
 		rawJson, err := ethereumMethodCall(rpcURL, "eth_sendRawTransaction", []interface{}{txHex})
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
-		if err = json.Unmarshal(rawJson, &txHash); err != nil {
-			return "", err
+		txHashString := ""
+		if err = json.Unmarshal(rawJson, &txHashString); err != nil {
+			return nil, err
 		}
 
-		return txHash, nil
+		txHashObject, err := HashFromHex(txHashString)
+		if err != nil {
+			return nil, err
+		}
+
+		return &txHashObject, nil
 	} else {
 		panic("this transaction type not yet implemented")
 	}
+}
+
+func WaitTransactionReady(rpcURL string, txHash *Hash) (*TransactionReceipt, error) {
+	for i := 0; i < 120; i++ {
+		receipt, err := GetTransactionReceipt(rpcURL, txHash)
+		if err != nil {
+			return nil, err
+		}
+
+		if receipt != nil {
+			if receipt.Status == 0 {
+				return nil, fmt.Errorf("transaction reverted")
+			}
+
+			return receipt, nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	return nil, fmt.Errorf("waiting for transaction timed out")
+}
+
+func GetTransactionReceipt(rpcURL string, txHash *Hash) (*TransactionReceipt, error) {
+	type rpcReceipt struct {
+		Type              string `json:"type"`
+		Status            string `json:"status"`
+		CumulativeGasUsed string `json:"cumulativeGasUsed"`
+		Logs              []struct {
+			Address          string   `json:"address"`
+			Topics           []string `json:"topics"`
+			Data             string   `json:"data"`
+			TransactionIndex string   `json:"transactionIndex"`
+			LogIndex         string   `json:"logIndex"`
+		} `json:"logs"`
+		TransactionHash   string `json:"transactionHash"`
+		TransactionIndex  string `json:"transactionIndex"`
+		BlockHash         string `json:"blockHash"`
+		BlockNumber       string `json:"blockNumber"`
+		GasUsed           string `json:"gasUsed"`
+		EffectiveGasPrice string `json:"effectiveGasPrice"`
+		From              string `json:"from"`
+		To                string `json:"to"`
+
+		ContractAddress string `json:"contractAddress"`
+	}
+
+	rawJson, err := ethereumMethodCall(rpcURL, "eth_getTransactionReceipt", []interface{}{(*txHash).String()})
+	if err != nil {
+		return nil, err
+	}
+
+	// Якщо транзакція ще не замайнена — RPC повертає null
+	if string(rawJson) == "null" {
+		return nil, nil
+	}
+
+	var raw rpcReceipt
+	if err := json.Unmarshal(rawJson, &raw); err != nil {
+		return nil, err
+	}
+
+	txType, err := strconv.ParseInt(strings.TrimPrefix(raw.Type, "0x"), 16, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := strconv.ParseInt(strings.TrimPrefix(raw.Status, "0x"), 16, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	cumulativeGasUsed, err := strconv.ParseUint(strings.TrimPrefix(raw.CumulativeGasUsed, "0x"), 16, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	transactionHash, err := HashFromHex(raw.TransactionHash)
+	if err != nil {
+		return nil, err
+	}
+
+	transactionIndex, err := strconv.ParseUint(strings.TrimPrefix(raw.TransactionIndex, "0x"), 16, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	blockHash, err := HashFromHex(raw.BlockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	blockNumber, ok := big.NewInt(0).SetString(strings.TrimPrefix(raw.BlockNumber, "0x"), 16)
+	if !ok {
+		return nil, errors.New("failed to extract block number from receipt")
+	}
+
+	gasUsed, err := strconv.ParseUint(strings.TrimPrefix(raw.GasUsed, "0x"), 16, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	effectiveGasPrice, ok := big.NewInt(0).SetString(strings.TrimPrefix(raw.EffectiveGasPrice, "0x"), 16)
+	if !ok {
+		return nil, errors.New("failed to extract effective gas price from receipt")
+	}
+
+	var contractAddress Address
+	if raw.ContractAddress != "" && raw.ContractAddress != "0x0000000000000000000000000000000000000000" {
+		contractAddress = MustFromHex(raw.ContractAddress)
+	}
+
+	logs := make([]Log, 0, 20)
+	for _, l := range raw.Logs {
+
+		logIndex, err := strconv.ParseUint(strings.TrimPrefix(l.LogIndex, "0x"), 16, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		logEntry := Log{
+			Address:          MustFromHex(l.Address),
+			Topics:           l.Topics,
+			Data:             l.Data,
+			TransactionIndex: transactionIndex,
+			LogIndex:         logIndex,
+		}
+
+		logs = append(logs, logEntry)
+	}
+
+	receipt := &TransactionReceipt{
+		Type:              int(txType),
+		Status:            int(status),
+		CumulativeGasUsed: cumulativeGasUsed,
+		Logs:              logs,
+		TransactionHash:   transactionHash,
+		TransactionIndex:  transactionIndex,
+		BlockHash:         blockHash,
+		BlockNumber:       blockNumber,
+		GasUsed:           gasUsed,
+		EffectiveGasPrice: effectiveGasPrice,
+		From:              MustFromHex(raw.From),
+		To:                MustFromHex(raw.To),
+
+		ContractAddress: &contractAddress,
+	}
+
+	return receipt, nil
 }
 
 func EncodeContractPayload(functionSignature string, args ...interface{}) ([]byte, error) {
@@ -857,6 +1024,32 @@ type TransactionLegacy struct {
 	Value    *big.Int
 	Data     []byte
 	V, R, S  *big.Int // додаються після підпису
+}
+
+type TransactionReceipt struct {
+	Type              int
+	Status            int // 1 = success, 0 = revert
+	CumulativeGasUsed uint64
+	Logs              []Log
+	TransactionHash   Hash
+	TransactionIndex  uint64 // Position of transaction inside block. Numeration from 0.
+	LogIndex          uint64 // Position of the log in the list of all block logs.
+	BlockHash         Hash
+	BlockNumber       *big.Int
+	GasUsed           uint64
+	EffectiveGasPrice *big.Int
+	From              Address
+	To                Address
+
+	ContractAddress *Address // Optional parameter, not nil for deploy
+}
+
+type Log struct {
+	Address          Address  // контракт-емітер
+	Topics           []string // hex hashes (topics[0] = eventID)
+	Data             string   // hex ABI data
+	TransactionIndex uint64
+	LogIndex         uint64
 }
 
 type rpcJsonResponse struct {
