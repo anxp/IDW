@@ -1026,32 +1026,6 @@ type TransactionLegacy struct {
 	V, R, S  *big.Int // додаються після підпису
 }
 
-type TransactionReceipt struct {
-	Type              int
-	Status            int // 1 = success, 0 = revert
-	CumulativeGasUsed uint64
-	Logs              []Log
-	TransactionHash   Hash
-	TransactionIndex  uint64 // Position of transaction inside block. Numeration from 0.
-	LogIndex          uint64 // Position of the log in the list of all block logs.
-	BlockHash         Hash
-	BlockNumber       *big.Int
-	GasUsed           uint64
-	EffectiveGasPrice *big.Int
-	From              Address
-	To                Address
-
-	ContractAddress *Address // Optional parameter, not nil for deploy
-}
-
-type Log struct {
-	Address          Address  // контракт-емітер
-	Topics           []string // hex hashes (topics[0] = eventID)
-	Data             string   // hex ABI data
-	TransactionIndex uint64
-	LogIndex         uint64
-}
-
 type rpcJsonResponse struct {
 	Jsonrpc string          `json:"jsonrpc"`
 	ID      int             `json:"id"`
@@ -1434,6 +1408,247 @@ func rlpEncodeTransactionLegacyAfterSigning(tx *TransactionLegacy) ([]byte, erro
 	}
 
 	return RLPEncode(list)
+}
+
+// =====================================================================================================================
+
+// =================================== LOGS PARSER & ABI DECODER =======================================================
+
+type TransactionReceipt struct {
+	Type              int
+	Status            int // 1 = success, 0 = revert
+	CumulativeGasUsed uint64
+	Logs              []Log
+	TransactionHash   Hash
+	TransactionIndex  uint64 // Position of transaction inside block. Numeration from 0.
+	LogIndex          uint64 // Position of the log in the list of all block logs.
+	BlockHash         Hash
+	BlockNumber       *big.Int
+	GasUsed           uint64
+	EffectiveGasPrice *big.Int
+	From              Address
+	To                Address
+
+	ContractAddress *Address // Optional parameter, not nil for deploy
+}
+
+type Log struct {
+	Address Address // контракт-емітер
+	// Topic structure:
+	// 	topics[0] - eventID, identifier of event type (what happened) (keccak256(EventSignature))
+	// 	topics[1..3] - indexed parameters (max 3)
+	Topics           []string
+	Data             string // hex ABI data
+	TransactionIndex uint64
+	LogIndex         uint64
+}
+
+type ABIType int
+
+const (
+	ABIAddress ABIType = iota
+	ABIUint256
+	ABIBool
+	ABIBytes32
+)
+
+type ABIEventParam struct {
+	Name    string
+	Type    ABIType
+	Indexed bool
+}
+
+type ABIEvent struct {
+	Name   string
+	Params []ABIEventParam
+}
+
+func (e ABIEvent) ID() Hash {
+	sig := e.Name + "("
+	for i, p := range e.Params {
+		if i > 0 {
+			sig += ","
+		}
+		sig += abiTypeToString(p.Type)
+	}
+	sig += ")"
+
+	return GetEventID(sig)
+}
+
+func abiTypeToString(t ABIType) string {
+	switch t {
+	case ABIAddress:
+		return "address"
+	case ABIUint256:
+		return "uint256"
+	case ABIBool:
+		return "bool"
+	case ABIBytes32:
+		return "bytes32"
+	default:
+		panic("unsupported ABI type")
+	}
+}
+
+type DecodedEvent struct {
+	Name   string
+	Fields map[string]interface{}
+}
+
+// DecodeEvent decodes log event to structured data with typed fields
+//
+//	Usage example. User describes event he wants to decode:
+//	approvalEvent := ABIEvent{
+//		Name: "Approval",
+//		Params: []ABIEventParam{
+//			{Name: "owner", Type: ABIAddress, Indexed: true},
+//			{Name: "spender", Type: ABIAddress, Indexed: true},
+//			{Name: "value", Type: ABIUint256, Indexed: false},
+//		},
+//	}
+//
+//	Decode it:
+//		ev, err := DecodeEvent(log, approvalEvent)
+//
+//	Assert types:
+//		owner := ev.Fields["owner"].(Address)
+//		spender := ev.Fields["spender"].(Address)
+//		value := ev.Fields["value"].(*big.Int)
+//		fmt.Println("Approval:", owner, spender, value)
+func DecodeEvent(log Log, event ABIEvent) (*DecodedEvent, error) {
+	if len(log.Topics) == 0 {
+		return nil, fmt.Errorf("log has no topics")
+	}
+
+	if log.Topics[0] != event.ID().Hex() {
+		return nil, fmt.Errorf("event signature mismatch")
+	}
+
+	result := &DecodedEvent{
+		Name:   event.Name,
+		Fields: make(map[string]interface{}),
+	}
+
+	topicIndex := 1
+	dataOffset := 0
+
+	for _, p := range event.Params {
+		if p.Indexed {
+			if topicIndex >= len(log.Topics) {
+				return nil, fmt.Errorf("missing indexed topic")
+			}
+
+			topicHash, err := HashFromHex(log.Topics[topicIndex])
+			if err != nil {
+				return nil, err
+			}
+
+			value, err := decodeData(topicHash[:], p.Type)
+			if err != nil {
+				return nil, err
+			}
+
+			result.Fields[p.Name] = value
+			topicIndex++
+		} else {
+			if dataOffset+32 > len(log.Data) {
+				return nil, fmt.Errorf("data too short")
+			}
+
+			hexValue := strings.TrimPrefix(log.Data, "0x")
+			bytesValue, err := hex.DecodeString(hexValue)
+			if err != nil {
+				return nil, err
+			}
+
+			chunk := bytesValue[dataOffset : dataOffset+32]
+
+			value, err := decodeData(chunk, p.Type)
+			if err != nil {
+				return nil, err
+			}
+
+			result.Fields[p.Name] = value
+			dataOffset += 32
+		}
+	}
+
+	return result, nil
+}
+
+// TODO: Implement more types using bytecast
+func decodeData(b []byte, t ABIType) (interface{}, error) {
+	switch t {
+
+	case ABIAddress:
+		var addr Address
+		copy(addr[:], b[12:32]) // last 20 bytes
+		return addr, nil
+
+	case ABIUint256:
+		return new(big.Int).SetBytes(b), nil
+
+	case ABIBool:
+		return b[31] == 1, nil
+
+	case ABIBytes32:
+		var out Hash
+		copy(out[:], b)
+		return out, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported ABI type")
+	}
+}
+
+// GetEventID calculates hash id for given event. For example:
+//
+//	transferID := GetEventID("Transfer(address,address,uint256)")
+func GetEventID(eventSignature string) Hash {
+	h := sha3.NewLegacyKeccak256()
+	h.Write([]byte(eventSignature))
+
+	sum := h.Sum(nil)
+	if len(sum) != 32 {
+		// Why panic? Because it's impossible to have length other than 32 here.
+		panic(fmt.Errorf("invalid keccak256 length: %d", len(sum)))
+	}
+
+	var hash Hash
+	copy(hash[:], sum)
+	return hash
+}
+
+func (r *TransactionReceipt) LogsByEvent(eventID Hash) []Log {
+	out := make([]Log, 0, 10)
+	for _, l := range r.Logs {
+		// Event signature (event ID) is always in Topics[0]!
+		if len(l.Topics) > 0 && strings.EqualFold(l.Topics[0], eventID.Hex()) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func (r *TransactionReceipt) LogsByAddress(addr Address) []Log {
+	out := make([]Log, 0, 10)
+	for _, l := range r.Logs {
+		if l.Address == addr {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func (r *TransactionReceipt) LogsByEventAndAddress(addr Address, eventID Hash) []Log {
+	out := make([]Log, 0, 10)
+	for _, l := range r.Logs {
+		if len(l.Topics) > 0 && strings.EqualFold(l.Topics[0], eventID.Hex()) && l.Address == addr {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // =====================================================================================================================
