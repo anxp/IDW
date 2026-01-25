@@ -3,7 +3,7 @@ module IndependentDexWatcher
 go 1.24.6
 
 require (
-	github.com/anxp/bytecast v0.0.0-20251026132452-3893c9d89951
+	github.com/anxp/bytecast v0.0.0-20260125173040-e047ab6501f1
 	golang.org/x/crypto v0.43.0
 )
 

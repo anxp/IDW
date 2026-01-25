@@ -6,6 +6,8 @@ github.com/anxp/bytecast v0.0.0-20251025162611-8f11782196a2 h1:2Lu5VfbQfObWiQjmV
 github.com/anxp/bytecast v0.0.0-20251025162611-8f11782196a2/go.mod h1:DNb7yrIkmrm+6ehllXP25z1N+KElPzOYMqOcQuqrXW0=
 github.com/anxp/bytecast v0.0.0-20251026132452-3893c9d89951 h1:VlXmzPOLCvvjKB2Sd+O6dWJIQmwrxUqBIHLI1thgJfQ=
 github.com/anxp/bytecast v0.0.0-20251026132452-3893c9d89951/go.mod h1:DNb7yrIkmrm+6ehllXP25z1N+KElPzOYMqOcQuqrXW0=
+github.com/anxp/bytecast v0.0.0-20260125173040-e047ab6501f1 h1:+MlxYUp7TpQrLv8yshthW3jsfOtk7bYYbCLIq0aDxWA=
+github.com/anxp/bytecast v0.0.0-20260125173040-e047ab6501f1/go.mod h1:DNb7yrIkmrm+6ehllXP25z1N+KElPzOYMqOcQuqrXW0=
 golang.org/x/crypto v0.43.0 h1:dduJYIi3A3KOfdGOHX8AVZ/jGiyPa3IbBozJ5kNuE04=
 golang.org/x/crypto v0.43.0/go.mod h1:BFbav4mRNlXJL4wNeejLpWxB7wMbc79PdRGhWKncxR0=
 golang.org/x/sys v0.37.0 h1:fdNQudmxPjkdUTPnLn5mdQv7Zwvbvpaxqs831goi9kQ=

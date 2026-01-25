@@ -1447,9 +1447,15 @@ type ABIType int
 
 const (
 	ABIAddress ABIType = iota
-	ABIUint256
 	ABIBool
 	ABIBytes32
+
+	ABIUint256
+	ABIUint160
+	ABIUint128
+
+	ABIInt256
+	ABIInt24
 )
 
 type ABIEventParam struct {
@@ -1480,12 +1486,23 @@ func abiTypeToString(t ABIType) string {
 	switch t {
 	case ABIAddress:
 		return "address"
-	case ABIUint256:
-		return "uint256"
 	case ABIBool:
 		return "bool"
 	case ABIBytes32:
 		return "bytes32"
+
+	case ABIUint256:
+		return "uint256"
+	case ABIUint160:
+		return "uint160"
+	case ABIUint128:
+		return "uint128"
+
+	case ABIInt256:
+		return "int256"
+	case ABIInt24:
+		return "int24"
+
 	default:
 		panic("unsupported ABI type")
 	}
@@ -1586,8 +1603,41 @@ func decodeData(b []byte, t ABIType) (interface{}, error) {
 		copy(addr[:], b[12:32]) // last 20 bytes
 		return addr, nil
 
-	case ABIUint256:
-		return new(big.Int).SetBytes(b), nil
+	case ABIUint256, ABIUint160, ABIUint128:
+		return big.NewInt(0).SetBytes(b), nil
+
+	case ABIInt256:
+		return bytecast.BigIntFromBytes(b), nil
+
+	case ABIInt24:
+		// ABI int24 is stored in 32 bytes, sign-extended
+		// We take last 3 bytes
+		v := int32(b[29])<<16 | int32(b[30])<<8 | int32(b[31])
+
+		// if sign bit (bit 23) is set → negative number
+		// 00000000 sxxxxxxx xxxxxxxx xxxxxxxx
+		// ↑        ↑
+		// біт 31   біт 23 (sign bit int24)
+		//
+		// What is sign extension?
+		//
+		//  0x7FFFFF = 00000000 01111111 11111111 11111111 - максимальне додатне int24
+		// ^0x7FFFFF = 11111111 10000000 00000000 00000000 - встановлює в 1 всі біти ВИЩЕ int24
+		//
+		// v before:
+		// 00000000 1xxxxxxx xxxxxxxx xxxxxxxx
+		//
+		// mask (^0x7FFFFF):
+		// 11111111 10000000 00000000 00000000
+		// ----------------------------------
+		// v after OR:
+		// 11111111 1xxxxxxx xxxxxxxx xxxxxxxx
+
+		if v&(1<<23) != 0 {
+			v |= ^0x7FFFFF // sign-extension to int32
+		}
+
+		return v, nil
 
 	case ABIBool:
 		return b[31] == 1, nil
