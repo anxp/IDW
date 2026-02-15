@@ -157,13 +157,13 @@ func HashFromHex(s string) (Hash, error) {
 //	feeProtocol                 uint8 : 68
 //	unlocked                     bool : true
 type Slot0Response struct {
-	SqrtPriceX96               *big.Int
-	Tick                       int64
-	ObservationIndex           uint16
-	ObservationCardinality     uint16
-	ObservationCardinalityNext uint16
-	FeeProtocol                uint8
-	Unlocked                   bool
+	SqrtPriceX96               *big.Int `evm:"uint160"`
+	Tick                       int32    `evm:"int24"`
+	ObservationIndex           uint16   `evm:"uint16"`
+	ObservationCardinality     uint16   `evm:"uint16"`
+	ObservationCardinalityNext uint16   `evm:"uint16"`
+	FeeProtocol                uint8    `evm:"uint8"`
+	Unlocked                   bool     `evm:"bool"`
 }
 
 // TicksResponse from UniswapV3 pool contract ticks(tick int24) method should have the following structure:
@@ -179,14 +179,14 @@ type Slot0Response struct {
 //	secondsOutside                  uint32 : 1754609140
 //	initialized                       bool : true
 type TicksResponse struct {
-	LiquidityGross                 *big.Int
-	LiquidityNet                   *big.Int
-	FeeGrowthOutside0X128          *big.Int
-	FeeGrowthOutside1X128          *big.Int
-	TickCumulativeOutside          *big.Int
-	SecondsPerLiquidityOutsideX128 *big.Int
-	SecondsOutside                 uint32
-	Initialized                    bool
+	LiquidityGross                 *big.Int `evm:"uint128"`
+	LiquidityNet                   *big.Int `evm:"int128"`
+	FeeGrowthOutside0X128          *big.Int `evm:"uint256"`
+	FeeGrowthOutside1X128          *big.Int `evm:"uint256"`
+	TickCumulativeOutside          int64    `evm:"int56"`
+	SecondsPerLiquidityOutsideX128 *big.Int `evm:"uint160"`
+	SecondsOutside                 uint32   `evm:"uint32"`
+	Initialized                    bool     `evm:"bool"`
 }
 
 func main() {
@@ -235,9 +235,9 @@ func main() {
 
 	_ = receipt
 
-	ticksResponse, err := ContractMethodCall[TicksResponse](rpcURLArbitrum, poolAddress, "ticks(int24)", int32(-193630))
-	slot0Response, err := ContractMethodCall[Slot0Response](rpcURLArbitrum, poolAddress, "slot0()")
-	token0Response, err := ContractMethodCall[Address](rpcURLArbitrum, poolAddress, "token0()")
+	ticksResponse, err := ContractMethodCall[TicksResponse](rpcURLArbitrum, poolAddress, "ticks(int24)", ABIMixed, int32(-193630))
+	slot0Response, err := ContractMethodCall[Slot0Response](rpcURLArbitrum, poolAddress, "slot0()", ABIMixed)
+	token0Response, err := ContractMethodCall[Address](rpcURLArbitrum, poolAddress, "token0()", ABIAddress)
 
 	_, _, _, _ = ticksResponse, slot0Response, token0Response, err
 
@@ -250,10 +250,15 @@ func main() {
 //	>>> See ExecuteTx for state-changing call
 //
 //	Usage examples:
-//		tickInfo, err := ContractMethodCall[TickResponse](rpcURL, poolAddress, "ticks(int24)", int32(-193252))
-//		slot0Response, err := ContractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()")
-//		token0Response, err := ContractMethodCall[Address](rpcURL, poolAddress, "token0()")
-func ContractMethodCall[T any](rpcURL, contractAddress, functionSignature string, args ...interface{}) (*T, error) {
+//		tickInfo, err := ContractMethodCall[TickResponse](rpcURL, poolAddress, "ticks(int24)", ABIMixed, int32(-193252))
+//		slot0Response, err := ContractMethodCall[Slot0Response](rpcURL, poolAddress, "slot0()", ABIMixed)
+//		token0Response, err := ContractMethodCall[Address](rpcURL, poolAddress, "token0()", ABIAddress)
+func ContractMethodCall[T any](rpcURL, contractAddress, functionSignature string, expectedEVMType ABIType, args ...interface{}) (*T, error) {
+
+	if expectedType := reflect.TypeFor[T](); expectedType.Kind() == reflect.Struct && expectedEVMType != ABIMixed {
+		return nil, fmt.Errorf("failed to match types - when struct expected in return, \"expectedEVMType\" parameter should be \"ABIMixed\"")
+	}
+
 	data, err := EncodeContractPayload(functionSignature, args...)
 	if err != nil {
 		return nil, err
@@ -286,7 +291,7 @@ func ContractMethodCall[T any](rpcURL, contractAddress, functionSignature string
 		return nil, err
 	}
 
-	return parseHexResponse[T](hexResult)
+	return parseHexResponse[T](hexResult, expectedEVMType)
 }
 
 // ExecuteTx executes transaction and returns transaction hash.
@@ -555,15 +560,25 @@ func GetTransactionReceipt(rpcURL string, txHash *Hash) (*TransactionReceipt, er
 	return receipt, nil
 }
 
-func EncodeContractPayload(functionSignature string, args ...interface{}) ([]byte, error) {
+func EncodeContractPayload(evmMethodSignature string, args ...interface{}) ([]byte, error) {
+	// Signature example: approve(address,uint256)
+	evmTypes, err := extractEVMArguments(evmMethodSignature)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(evmTypes) != len(args) {
+		return nil, fmt.Errorf("number of arguments in signature does not match number of passed arguments")
+	}
+
 	hash := sha3.NewLegacyKeccak256()
-	hash.Write([]byte(functionSignature))
+	hash.Write([]byte(evmMethodSignature))
 	fullHash := hash.Sum(nil)
 	selector := fullHash[:4] // selector is first 4 bytes of signature hash
 	data := append([]byte{}, selector...)
 
-	for _, arg := range args {
-		encoded, err := encodeValue(arg)
+	for i, evmType := range evmTypes {
+		encoded, err := encodeData(args[i], stringToAbiType(evmType))
 		if err != nil {
 			return nil, err
 		}
@@ -575,7 +590,8 @@ func EncodeContractPayload(functionSignature string, args ...interface{}) ([]byt
 
 // parseHexResponse parses eth_call response to structured data of type T.
 //   - hexDataIn - input data as hex string
-func parseHexResponse[T any](hexDataIn string) (*T, error) {
+//   - expectedEVMType - type, which EVM uses for this variable (data). Use ABIMixed if not-scalar return (struct) is expected.
+func parseHexResponse[T any](hexDataIn string, expectedEVMType ABIType) (*T, error) {
 	hexDataIn = strings.TrimPrefix(hexDataIn, "0x")
 
 	if len(hexDataIn) < 64 { // 64 symbols in hex string = 32 bytes
@@ -598,31 +614,67 @@ func parseHexResponse[T any](hexDataIn string) (*T, error) {
 	if expectedType.Kind() == reflect.Struct {
 		numOfFields := resultValue.NumField()
 
-		if len(data) < 32*numOfFields {
-			return nil, fmt.Errorf("input data too short, expected at least %d bytes (32B x %d fields), got %d bytes instead", 32*numOfFields, numOfFields, len(data))
+		if len(data) != 32*numOfFields {
+			return nil, fmt.Errorf("input data length mismatch number of fields, expected %d bytes (32B x %d fields), got %d bytes instead", 32*numOfFields, numOfFields, len(data))
 		}
 
 		for i := 0; i < numOfFields; i++ {
 			field := resultValue.Field(i)
+			tag := expectedType.Field(i).Tag.Get("evm")
 
-			value, err := decodeValue(field.Type(), getFieldBytes(data, i))
-			if err != nil {
-				return nil, err
+			if tag == "" {
+				return nil, fmt.Errorf("failed parse data into \"%s\" type - field \"%s\" missing evm tag", expectedType.Name(), expectedType.Field(i).Name)
 			}
 
-			field.Set(value)
+			fieldBytes := getFieldBytes(data, i)
+			abiType := stringToAbiType(tag)
+			dataDecodedInterface, err := decodeData(fieldBytes[:], abiType)
+			if err != nil {
+				return nil, fmt.Errorf("field %s: %w", expectedType.Field(i).Name, err)
+			}
+
+			field.Set(reflect.ValueOf(dataDecodedInterface))
 		}
 
 		return &result, nil
 	}
 
-	value, err := decodeValue(expectedType, getFieldBytes(data, 0))
+	if expectedEVMType == ABIMixed {
+		return nil, fmt.Errorf("explicit EVM type should be specified when decoding scalar value (not ABIMixed)")
+	}
+
+	fieldBytes := getFieldBytes(data, 0)
+	dataDecodedInterface, err := decodeData(fieldBytes[:], expectedEVMType)
 	if err != nil {
 		return nil, err
 	}
 
-	resultValue.Set(value)
+	resultValue.Set(reflect.ValueOf(dataDecodedInterface))
 	return &result, nil
+}
+
+func extractEVMArguments(evmMethodSignature string) ([]string, error) {
+	start := strings.IndexByte(evmMethodSignature, '(')
+	end := strings.LastIndexByte(evmMethodSignature, ')')
+
+	if start == -1 || end == -1 || end < start {
+		return nil, fmt.Errorf("invalid EVM method signature: %s", evmMethodSignature)
+	}
+
+	args := strings.TrimSpace(evmMethodSignature[start+1 : end])
+
+	if args == "" {
+		// TODO: Check what better - nil or empty slice?
+		return nil, nil // no args, no errors
+	}
+
+	parts := strings.Split(args, ",")
+
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+
+	return parts, nil
 }
 
 // getFieldBytes returns exactly 32 raw bytes of field #fieldNumber or panic.
@@ -637,86 +689,6 @@ func getFieldBytes(allData []byte, fieldNumber int) [32]byte {
 	}
 
 	return [32]byte(fieldData)
-}
-
-func decodeValue(fieldType reflect.Type, bytes32 [32]byte) (reflect.Value, error) {
-
-	switch fieldType {
-	case reflect.TypeOf((*big.Int)(nil)):
-		bigIntValue := bytecast.BigIntFromBytes(bytes32[:])
-		return reflect.ValueOf(bigIntValue), nil
-
-	case reflect.TypeOf(Address{}):
-		addressValue := Address(bytes32[12:32])
-		return reflect.ValueOf(addressValue), nil
-
-	case reflect.TypeOf(int64(0)):
-		int64Value := bytecast.Int64From8Bytes([8]byte(bytes32[24:]))
-		return reflect.ValueOf(int64Value), nil
-
-	case reflect.TypeOf(int32(0)):
-		int32Value := bytecast.Int32From4Bytes([4]byte(bytes32[28:]))
-		return reflect.ValueOf(int32Value), nil
-
-	case reflect.TypeOf(uint32(0)):
-		uint32Value := bytecast.Uint32From4Bytes([4]byte(bytes32[28:]))
-		return reflect.ValueOf(uint32Value), nil
-
-	case reflect.TypeOf(uint16(0)):
-		uint16Value := bytecast.Uint16From2Bytes([2]byte(bytes32[30:]))
-		return reflect.ValueOf(uint16Value), nil
-
-	case reflect.TypeOf(uint8(0)):
-		uint8Value := bytecast.Uint8From1Byte([1]byte(bytes32[31:]))
-		return reflect.ValueOf(uint8Value), nil
-
-	case reflect.TypeOf(false):
-		boolValue := bytecast.BoolFrom1Byte([1]byte(bytes32[31:]))
-		return reflect.ValueOf(boolValue), nil
-	}
-
-	return reflect.Value{}, fmt.Errorf("failed to decode bytes - unsupported type: %v", fieldType)
-}
-
-func encodeValue(value interface{}) ([32]byte, error) {
-	var encodedValue []byte
-	var err error
-
-	switch value.(type) {
-	case *big.Int:
-		encodedValue, err = bytecast.BigIntToBytesAndExpandWidth(value.(*big.Int), 32)
-
-	case Address:
-		address := value.(Address)
-		encodedValue = bytecast.LeftPadBytes00(address.Bytes(), 32)
-
-	case int64:
-		encodedValue, err = bytecast.Int64ToBytesAndExpandWidth(value.(int64), 32)
-
-	case int32:
-		encodedValue, err = bytecast.Int32ToBytesAndExpandWidth(value.(int32), 32)
-
-	case uint32:
-		encodedValue, err = bytecast.Uint32ToBytesAndExpandWidth(value.(uint32), 32)
-
-	case uint16:
-		encodedValue, err = bytecast.Uint16ToBytesAndExpandWidth(value.(uint16), 32)
-
-	case uint8:
-		encodedValue, err = bytecast.Uint8ToBytesAndExpandWidth(value.(uint8), 32)
-
-	case bool:
-		encodedValue, err = bytecast.BoolToBytesAndExpandWidth(value.(bool), 32)
-
-	default:
-		err = fmt.Errorf("failed to encode typed value to 32B field - unsupported argument type: %T", value)
-	}
-
-	if err != nil {
-		return [32]byte{}, err
-	}
-
-	return [32]byte(encodedValue), nil
 }
 
 // =================================== RLP Encoder (move to separate package) ==========================================
@@ -1446,15 +1418,26 @@ type Log struct {
 type ABIType int
 
 const (
-	ABIAddress ABIType = iota
+	// ABIMixed
+	// Use this type for ContractMethodCall "expectedEVMType" parameter, when not-scalar return (structure) is expected.
+	// In this case structure fields should be properly tagged with "evm" tag, specifying their scalar type.
+	ABIMixed ABIType = iota
+
+	ABIAddress
 	ABIBool
 	ABIBytes32
 
 	ABIUint256
 	ABIUint160
 	ABIUint128
+	ABIUint32
+	ABIUint16
+	ABIUint8
 
 	ABIInt256
+	ABIInt128
+	ABIInt64
+	ABIInt56
 	ABIInt24
 )
 
@@ -1497,14 +1480,64 @@ func abiTypeToString(t ABIType) string {
 		return "uint160"
 	case ABIUint128:
 		return "uint128"
+	case ABIUint32:
+		return "uint32"
+	case ABIUint16:
+		return "uint16"
+	case ABIUint8:
+		return "uint8"
 
 	case ABIInt256:
 		return "int256"
+	case ABIInt128:
+		return "int128"
+	case ABIInt64:
+		return "int64"
+	case ABIInt56:
+		return "int56"
 	case ABIInt24:
 		return "int24"
 
 	default:
 		panic("unsupported ABI type")
+	}
+}
+
+func stringToAbiType(s string) ABIType {
+	switch s {
+	case "address":
+		return ABIAddress
+	case "bool":
+		return ABIBool
+	case "bytes32":
+		return ABIBytes32
+
+	case "uint256":
+		return ABIUint256
+	case "uint160":
+		return ABIUint160
+	case "uint128":
+		return ABIUint128
+	case "uint32":
+		return ABIUint32
+	case "uint16":
+		return ABIUint16
+	case "uint8":
+		return ABIUint8
+
+	case "int256":
+		return ABIInt256
+	case "int128":
+		return ABIInt128
+	case "int64":
+		return ABIInt64
+	case "int56":
+		return ABIInt56
+	case "int24":
+		return ABIInt24
+
+	default:
+		panic("invalid ABI tag: " + s)
 	}
 }
 
@@ -1594,6 +1627,76 @@ func DecodeEvent(log Log, event ABIEvent) (*DecodedEvent, error) {
 	return result, nil
 }
 
+func encodeData(value interface{}, t ABIType) ([32]byte, error) {
+	var out []byte
+	var err error
+
+	switch t {
+
+	case ABIAddress:
+		addr, ok := value.(Address)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected Address, got %T", value)
+		}
+		out = bytecast.LeftPadBytes00(addr.Bytes(), 32)
+
+	case ABIUint256, ABIUint160, ABIUint128,
+		ABIInt256, ABIInt128:
+		bi, ok := value.(*big.Int)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected *big.Int, got %T", value)
+		}
+		out, err = bytecast.BigIntToBytesAndExpandWidth(bi, 32)
+
+	case ABIInt56:
+		v, ok := value.(int64)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected int64 for int56, got %T", value)
+		}
+		out, err = bytecast.IntXXToBytesAndExpandWidth(v, 56, 32)
+
+	case ABIInt24:
+
+		v, ok := value.(int32)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected int32 for int24, got %T", value)
+		}
+		out, err = bytecast.IntXXToBytesAndExpandWidth(int64(v), 24, 32)
+
+	case ABIUint32:
+		v, ok := value.(uint32)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected uint32, got %T", value)
+		}
+		out, err = bytecast.UintXXToBytesAndExpandWidth(uint64(v), 32, 32)
+
+	case ABIBool:
+		b, ok := value.(bool)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected bool, got %T", value)
+		}
+		out, err = bytecast.BoolToBytesAndExpandWidth(b, 32)
+
+	case ABIBytes32:
+		h, ok := value.(Hash)
+		if !ok {
+			return [32]byte{}, fmt.Errorf("expected Hash, got %T", value)
+		}
+		out = h[:]
+
+	default:
+		return [32]byte{}, fmt.Errorf("unsupported ABI type: %v", t)
+	}
+
+	if err != nil {
+		return [32]byte{}, err
+	}
+
+	var fixed [32]byte
+	copy(fixed[:], out)
+	return fixed, nil
+}
+
 // TODO: Implement more types using bytecast
 func decodeData(b []byte, t ABIType) (interface{}, error) {
 	switch t {
@@ -1603,41 +1706,93 @@ func decodeData(b []byte, t ABIType) (interface{}, error) {
 		copy(addr[:], b[12:32]) // last 20 bytes
 		return addr, nil
 
-	case ABIUint256, ABIUint160, ABIUint128:
-		return big.NewInt(0).SetBytes(b), nil
-
-	case ABIInt256:
-		return bytecast.BigIntFromBytes(b), nil
-
-	case ABIInt24:
-		// ABI int24 is stored in 32 bytes, sign-extended
-		// We take last 3 bytes
-		v := int32(b[29])<<16 | int32(b[30])<<8 | int32(b[31])
-
-		// if sign bit (bit 23) is set → negative number
-		// 00000000 sxxxxxxx xxxxxxxx xxxxxxxx
-		// ↑        ↑
-		// біт 31   біт 23 (sign bit int24)
-		//
-		// What is sign extension?
-		//
-		//  0x7FFFFF = 00000000 01111111 11111111 11111111 - максимальне додатне int24
-		// ^0x7FFFFF = 11111111 10000000 00000000 00000000 - встановлює в 1 всі біти ВИЩЕ int24
-		//
-		// v before:
-		// 00000000 1xxxxxxx xxxxxxxx xxxxxxxx
-		//
-		// mask (^0x7FFFFF):
-		// 11111111 10000000 00000000 00000000
-		// ----------------------------------
-		// v after OR:
-		// 11111111 1xxxxxxx xxxxxxxx xxxxxxxx
-
-		if v&(1<<23) != 0 {
-			v |= ^0x7FFFFF // sign-extension to int32
+	case ABIUint256:
+		v, err := bytecast.BigIntXXXFromBytes(b, 256)
+		if err != nil {
+			return nil, err
 		}
 
 		return v, nil
+
+	case ABIUint160:
+		v, err := bytecast.BigIntXXXFromBytes(b, 160)
+		if err != nil {
+			return nil, err
+		}
+
+		return v, nil
+
+	case ABIUint128:
+		v, err := bytecast.BigIntXXXFromBytes(b, 128)
+		if err != nil {
+			return nil, err
+		}
+
+		return v, nil
+
+	case ABIInt256:
+		v, err := bytecast.BigIntXXXFromBytes(b, 256)
+		if err != nil {
+			return nil, err
+		}
+
+		return v, nil
+
+	case ABIInt128:
+		v, err := bytecast.BigIntXXXFromBytes(b, 128)
+		if err != nil {
+			return nil, err
+		}
+
+		return v, nil
+
+	case ABIInt64:
+		v, err := bytecast.IntXXFromBytes(b, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		return v, nil
+
+	case ABIInt56:
+		v, err := bytecast.IntXXFromBytes(b, 56)
+		if err != nil {
+			return nil, err
+		}
+
+		return v, nil
+
+	case ABIInt24:
+		v, err := bytecast.IntXXFromBytes(b, 24)
+		if err != nil {
+			return nil, err
+		}
+
+		return int32(v), nil
+
+	case ABIUint32:
+		v, err := bytecast.UintXXFromBytes(b, 32)
+		if err != nil {
+			return nil, err
+		}
+
+		return uint32(v), nil
+
+	case ABIUint16:
+		v, err := bytecast.UintXXFromBytes(b, 16)
+		if err != nil {
+			return nil, err
+		}
+
+		return uint16(v), nil
+
+	case ABIUint8:
+		v, err := bytecast.UintXXFromBytes(b, 8)
+		if err != nil {
+			return nil, err
+		}
+
+		return uint8(v), nil
 
 	case ABIBool:
 		return b[31] == 1, nil
